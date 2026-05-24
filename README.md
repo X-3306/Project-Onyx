@@ -14,6 +14,16 @@ Advanced EDR Evasion via AI Telemetry Spoofing & WASM Sandboxing. Project Onyx i
 
 See `docs/architecture.md` for the full end-to-end technical sketch.
 
+## ⚠️ Legal Disclaimer
+
+This project is created solely for educational purposes, security research, and authorized Red Team operations. 
+
+The techniques demonstrated in this repository (Project Onyx) are intended to help security professionals understand advanced evasion methods and improve endpoint defenses (EDR/XDR). 
+
+**Do not use this software on any system or network that you do not own or have explicit, written permission to test.**
+
+The author of this project (X-3306) assume no liability and are not responsible for any misuse, damage, or illegal activities caused by the use of this software. By downloading, compiling, or using this code, you agree to take full responsibility for your actions.
+
 ## Repository Layout
 
 - `DiagnosticsTool.cpp` - C++ Windows host and Wasm3/ONNX integration.
