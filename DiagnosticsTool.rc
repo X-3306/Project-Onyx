@@ -1,0 +1,4 @@
+#include "resource.h"
+
+IDR_ONNX_MODEL     RCDATA "assets/model.onnx"
+IDR_WASM_ENCRYPTED RCDATA "assets/license_module.wasm.aes"

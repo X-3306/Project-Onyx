@@ -1,0 +1,131 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="920" viewBox="0 0 1400 920" role="img" aria-labelledby="title desc">
+  <title id="title">Project Onyx End-to-End Architecture</title>
+  <desc id="desc">Build-time and runtime architecture for the Project Onyx Windows heartbeat proof of concept.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7f8fa; }
+      .lane { fill: #ffffff; stroke: #c8d0dc; stroke-width: 2; }
+      .box { fill: #eef4ff; stroke: #315a9c; stroke-width: 2; rx: 8; }
+      .box2 { fill: #eefaf4; stroke: #26704a; stroke-width: 2; rx: 8; }
+      .box3 { fill: #fff7e6; stroke: #9a6500; stroke-width: 2; rx: 8; }
+      .box4 { fill: #f4efff; stroke: #6545a8; stroke-width: 2; rx: 8; }
+      .title { font: 700 24px Arial, sans-serif; fill: #151922; }
+      .laneTitle { font: 700 18px Arial, sans-serif; fill: #252b36; }
+      .text { font: 14px Arial, sans-serif; fill: #1f2733; }
+      .small { font: 12px Arial, sans-serif; fill: #3d4654; }
+      .arrow { stroke: #344054; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #7a8699; stroke-width: 2; stroke-dasharray: 6 6; fill: none; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#344054" />
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1400" height="920" />
+  <text class="title" x="50" y="50">Project Onyx End-to-End Architecture</text>
+  <text class="small" x="50" y="75">Windows C++ host + embedded ONNX metadata vault + encrypted WebAssembly heartbeat module</text>
+
+  <rect class="lane" x="40" y="110" width="1320" height="210" rx="12" />
+  <text class="laneTitle" x="65" y="142">Build Time</text>
+
+  <rect class="box" x="80" y="170" width="200" height="82" />
+  <text class="text" x="105" y="199">build.py fingerprint</text>
+  <text class="small" x="105" y="222">MachineGuid + SID</text>
+  <text class="small" x="105" y="240">+ C: volume serial</text>
+
+  <rect class="box" x="340" y="170" width="210" height="82" />
+  <text class="text" x="365" y="199">Rust Wasm module</text>
+  <text class="small" x="365" y="222">cargo wasm32 build</text>
+  <text class="small" x="365" y="240">heartbeat JSON logic</text>
+
+  <rect class="box2" x="610" y="150" width="250" height="120" />
+  <text class="text" x="635" y="181">build.py build</text>
+  <text class="small" x="635" y="204">create tiny ONNX graph</text>
+  <text class="small" x="635" y="222">embed authenticated vault</text>
+  <text class="small" x="635" y="240">encrypt Wasm with AES-CBC</text>
+
+  <rect class="box3" x="925" y="150" width="185" height="120" />
+  <text class="text" x="950" y="181">Generated assets</text>
+  <text class="small" x="950" y="204">assets/model.onnx</text>
+  <text class="small" x="950" y="222">assets/*.wasm.aes</text>
+  <text class="small" x="950" y="240">ignored by Git</text>
+
+  <rect class="box4" x="1165" y="150" width="150" height="120" />
+  <text class="text" x="1190" y="181">CMake + RC</text>
+  <text class="small" x="1190" y="204">embed resources</text>
+  <text class="small" x="1190" y="222">link Wasm3</text>
+  <text class="small" x="1190" y="240">link static ORT</text>
+
+  <path class="arrow" d="M280 211 H610" />
+  <path class="arrow" d="M550 211 H610" />
+  <path class="arrow" d="M860 211 H925" />
+  <path class="arrow" d="M1110 211 H1165" />
+
+  <rect class="lane" x="40" y="360" width="1320" height="500" rx="12" />
+  <text class="laneTitle" x="65" y="392">Runtime</text>
+
+  <rect class="box" x="80" y="430" width="190" height="86" />
+  <text class="text" x="105" y="459">ProjectOnyx.exe</text>
+  <text class="small" x="105" y="482">single build artifact</text>
+  <text class="small" x="105" y="500">Windows process</text>
+
+  <rect class="box" x="320" y="430" width="210" height="86" />
+  <text class="text" x="345" y="459">Fingerprint</text>
+  <text class="small" x="345" y="482">SHA-256 over local</text>
+  <text class="small" x="345" y="500">environment values</text>
+
+  <rect class="box2" x="585" y="420" width="235" height="110" />
+  <text class="text" x="610" y="450">ONNX Runtime session</text>
+  <text class="small" x="610" y="473">load model from .rsrc</text>
+  <text class="small" x="610" y="491">run bait workload</text>
+  <text class="small" x="610" y="509">read metadata vault</text>
+
+  <rect class="box2" x="875" y="420" width="230" height="110" />
+  <text class="text" x="900" y="450">Vault unlock</text>
+  <text class="small" x="900" y="473">PBKDF2 + HKDF</text>
+  <text class="small" x="900" y="491">constant-time HMAC</text>
+  <text class="small" x="900" y="509">AES-CBC decrypt</text>
+
+  <rect class="box3" x="1155" y="420" width="170" height="110" />
+  <text class="text" x="1180" y="450">Wasm bytes</text>
+  <text class="small" x="1180" y="473">load encrypted .rsrc</text>
+  <text class="small" x="1180" y="491">decrypt in memory</text>
+  <text class="small" x="1180" y="509">zero buffers later</text>
+
+  <path class="arrow" d="M270 473 H320" />
+  <path class="arrow" d="M530 473 H585" />
+  <path class="arrow" d="M820 473 H875" />
+  <path class="arrow" d="M1105 473 H1155" />
+
+  <rect class="box4" x="250" y="615" width="230" height="110" />
+  <text class="text" x="275" y="645">Wasm3 runtime</text>
+  <text class="small" x="275" y="668">parse module from RAM</text>
+  <text class="small" x="275" y="686">register host imports</text>
+  <text class="small" x="275" y="704">call run()</text>
+
+  <rect class="box4" x="545" y="615" width="220" height="110" />
+  <text class="text" x="570" y="645">Host ABI</text>
+  <text class="small" x="570" y="668">fingerprint/status/time</text>
+  <text class="small" x="570" y="686">submit_json</text>
+  <text class="small" x="570" y="704">post_teams_json alias</text>
+
+  <rect class="box3" x="835" y="615" width="210" height="110" />
+  <text class="text" x="860" y="645">Heartbeat JSON</text>
+  <text class="small" x="860" y="668">built inside Wasm</text>
+  <text class="small" x="860" y="686">copied back to host</text>
+  <text class="small" x="860" y="704">bounded demo output</text>
+
+  <rect class="box2" x="1115" y="615" width="190" height="110" />
+  <text class="text" x="1140" y="645">Optional Slack POST</text>
+  <text class="small" x="1140" y="668">only when env var set</text>
+  <text class="small" x="1140" y="686">HTTPS WinHTTP</text>
+  <text class="small" x="1140" y="704">then cleanup</text>
+
+  <path class="arrow" d="M1240 530 V585 H365 V615" />
+  <path class="arrow" d="M480 670 H545" />
+  <path class="arrow" d="M765 670 H835" />
+  <path class="dash" d="M1045 670 H1115" />
+
+  <rect class="lane" x="80" y="785" width="1245" height="48" rx="8" />
+  <text class="text" x="105" y="815">Cleanup: decrypted Wasm, AES material, vault buffers, host copies, and temporary JSON are securely cleared before process exit.</text>
+</svg>
