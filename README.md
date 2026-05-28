@@ -3,6 +3,8 @@
 # Project Onyx
 Advanced EDR Evasion via AI Telemetry Spoofing & WASM Sandboxing. Project Onyx is a PoC Red Team pipeline designed to demonstrate advanced evasion techniques against modern EDR systems. It shifts away from traditional signature-based obfuscation towards behavioral camouflage and strict environmental keying.
 
+Research Perspective: The goal of Project Onyx is not to claim a working bypass of production EDR systems, it is to explore what an unconventional, multi-layer pipeline could look like if each concept were developed further. The individual components (AI telemetry camouflage, environmental keying, in-memory WASM execution) are implemented and functional as a chain, but each layer would require significantly deeper research to be meaningful against real-world defenses. This project is best understood as an architectural sketch and a starting point for that kind of exploration.
+
 ## Core Concepts
 
 1. **AI Decoy (Behavioral Camouflage):** Modern EDRs monitor API calls and execution flows. Project Onyx embeds a legitimate, functional ONNX neural network (a tiny MLP). Before any malicious logic is executed, the host runs a real tensor inference workload using Microsoft's `onnxruntime`. This generates legitimate AI execution telemetry, masking the true intent of the process.
