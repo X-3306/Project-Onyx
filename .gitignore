@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+out/
+dist/
+onnxruntime/
+assets/model.onnx
+assets/model.onnx.sha256
+assets/license_module.wasm.aes
+assets/downlink_update*.onnx
+assets/lab_heartbeat*.json
+wasm_license_module/target/
