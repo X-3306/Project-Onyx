@@ -39,24 +39,6 @@ target_include_directories(onnxruntime_static INTERFACE
 
 file(GLOB ORT_THIRD_PARTY_LIBS CONFIGURE_DEPENDS "${ORT_THIRD_PARTY_LIB_DIR}/*.lib")
 
-set(ORT_STATIC_LIBS
-    "${ORT_BUILD_DIR}/onnxruntime_session.lib"
-    "${ORT_BUILD_DIR}/onnxruntime_framework.lib"
-    "${ORT_BUILD_DIR}/onnxruntime_graph.lib"
-    "${ORT_BUILD_DIR}/onnxruntime_optimizer.lib"
-    "${ORT_BUILD_DIR}/onnxruntime_providers.lib"
-    "${ORT_BUILD_DIR}/onnxruntime_util.lib"
-    "${ORT_BUILD_DIR}/onnxruntime_common.lib"
-    "${ORT_BUILD_DIR}/onnxruntime_flatbuffers.lib"
-    "${ORT_BUILD_DIR}/onnxruntime_mlas.lib"
-    "${ORT_BUILD_DIR}/onnxruntime_lora.lib"
-)
-
-target_link_libraries(onnxruntime_static INTERFACE
-    ${ORT_STATIC_LIBS}
-    ${ORT_THIRD_PARTY_LIBS}
-)
-
 set(WASM3_SOURCES
     wasm3/source/m3_bind.c
     wasm3/source/m3_code.c
@@ -68,6 +50,25 @@ set(WASM3_SOURCES
     wasm3/source/m3_info.c
     wasm3/source/m3_module.c
     wasm3/source/m3_parse.c
+)
+
+set(ORT_STATIC_LIBS
+    "${ORT_BUILD_DIR}/onnxruntime_session.lib"
+    "${ORT_BUILD_DIR}/onnxruntime_framework.lib"
+    "${ORT_BUILD_DIR}/onnxruntime_graph.lib"
+    "${ORT_BUILD_DIR}/onnxruntime_optimizer.lib"
+    "${ORT_BUILD_DIR}/onnxruntime_providers.lib"
+    "${ORT_BUILD_DIR}/onnxruntime_util.lib"
+    "${ORT_BUILD_DIR}/onnxruntime_common.lib"
+    "${ORT_BUILD_DIR}/onnxruntime_flatbuffers.lib"
+    "${ORT_BUILD_DIR}/onnxruntime_mlas.lib"
+    "${ORT_BUILD_DIR}/onnxruntime_lora.lib"
+    "${PROJECT_ONYX_ORT_BUILD_ROOT}/model_package/Release/model_package.lib"
+)
+
+target_link_libraries(onnxruntime_static INTERFACE
+    ${ORT_STATIC_LIBS}
+    ${ORT_THIRD_PARTY_LIBS}
 )
 
 add_executable(ProjectOnyx
