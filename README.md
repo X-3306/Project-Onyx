@@ -266,4 +266,13 @@ lateral movement, arbitrary command execution, destructive behavior, or bundled
 private webhook tokens. The WebAssembly module is constrained to formatting and
 returning a heartbeat JSON as a simple PoC. The additional model-update downlink
 can only alter that heartbeat status through the `heartbeat_ack` / `set_status`
-whitelist, if you have some interesting ideas for this project, feel free to contact: X3306.Business@proton.me
+whitelist. If you have some interesting ideas for this project, feel free to contact: X3306.Business@proton.me
+
+<p align="center">
+  <a href="https://trendshift.io/repositories/37934?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-37934" target="_blank" rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/trendshift/repositories/37934/daily?language=C" alt="Project Onyx Daily Trend" width="250" height="55"/>
+  </a>
+  <a href="https://trendshift.io/repositories/37934?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-37934" target="_blank" rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/trendshift/repositories/37934/weekly?language=C" alt="Project Onyx Weekly Trend" width="250" height="55"/>
+  </a>
+</p>
