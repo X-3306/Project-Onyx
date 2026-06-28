@@ -3,9 +3,9 @@
 // Project: https://github.com/X-3306/Project-Onyx 
 // Phase 1 - Machine fingerprint -> SHA-256
 // Phase 2 - Hash -> ONNX model from .rsrc -> bait workload + weight/metadata vault unlock
-// Phase 3 - Dead-Drop C2 via downlink model updates -> heartbeat/status only
-// Phase 4 - encrypted WASM from .rsrc -> AES-256-CBC -> raw WASM bytes in RAM
-// Phase 5 - Wasm3: host function registration -> module execution from RAM
+// Phase 3 - encrypted WASM from .rsrc -> AES-256-CBC -> raw WASM bytes in RAM
+// Phase 4 - Wasm3: host function registration -> module execution from RAM
+// Phase 5 - Research Extension: Dead-Drop C2 via downlink model updates -> heartbeat/status only
 //
 // Host functions exposed to the WASM module:
 //   host.get_fingerprint_ptr  () -> i32   ptr to SHA-256 hex copied into WASM memory
