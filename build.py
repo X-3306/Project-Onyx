@@ -12,6 +12,8 @@ is retained as a compatible, inspectable fallback.
 Generated private artifacts for example:
   assets/model.onnx
   assets/license_module.wasm.aes
+
+Note: C++ implementation (DiagnosticTool.cpp) uses a compile-time constant: "kNaturalMinAbsDelta = 1.0e-5". keep this in mind when testing.
 """
 
 from __future__ import annotations
