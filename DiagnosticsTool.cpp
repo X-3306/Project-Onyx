@@ -1596,7 +1596,7 @@ static bool ParseUnsignedLongField(const std::string& text, ULONG& value)
         if (ch < '0' || ch > '9')
             return false;
         parsed = parsed * 10UL + static_cast<unsigned long>(ch - '0');
-        if (parsed > 5000000UL)
+        if (parsed > 5000000UL) // cap: 5M iterations
             return false;
     }
     if (parsed == 0)
