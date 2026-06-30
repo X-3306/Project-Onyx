@@ -25,6 +25,7 @@ The runtime payload is intentionally limited to a heartbeat beacon, allowing the
 ## Highly Recommended
 
 See `docs/architecture.md` for the FULL end-to-end technical sketch. (I recommend, for better understanding).
+and also the entire process: my mistakes, the concepts and ideas I considered along the way, and the architectural tradeoffs I faced while building Project Onyx. [Medium](https://medium.com/@X-3306/shifting-the-edr-evasion-angle-from-signature-obfuscation-to-behavioral-camouflage-9b7ec93766f6)
 
 ## Legal Disclaimer
 
